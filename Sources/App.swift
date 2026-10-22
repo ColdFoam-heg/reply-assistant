@@ -233,7 +233,7 @@ topY: 1 - bb.maxY, bottomY: 1 - bb.minY))
 }
 cont.resume(returning: boxes)
 }
-req.recognitionLevel =.accurate
+req.recognitionLevel = .accurate
 req.recognitionLanguages = ["zh-Hans", "en-US"]
 req.usesLanguageCorrection = true
 let handler = VNImageRequestHandler(cgImage: cg, options: [:])
@@ -267,11 +267,11 @@ let text = g.map { $0.text}.joined(separator: "")
 if text.isEmpty { continue}
 let speaker: Speaker
 if avgCX < 0.46 {
-speaker =.other
+speaker = .other
 } else if avgCX > 0.54 {
-speaker =.me
+speaker = .me
 } else {
-speaker =.system
+speaker = .system
 }
 lines.append(ChatLine(speaker: speaker, text: text))
 }
@@ -362,7 +362,7 @@ let d = obj?["data"] as? [String: Any]
 let freeTier = (d?["is_free_tier"] as? Bool) ?? false
 let usage = (d?["usage"] as? NSNumber)?.doubleValue ?? 0
 var text = "连接成功"
-text += freeTier? " · 免费层账号": " · 付费层账号"
+text += freeTier ? " · 免费层账号" : " · 付费层账号"
 text += " · 累计用量 $\(String(format: "%.3f", usage))"
 if let limit = d?["limit"] as? NSNumber {
 text += " / 额度 $\(String(format: "%.2f", limit.doubleValue))"

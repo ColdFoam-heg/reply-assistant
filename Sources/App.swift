@@ -28,19 +28,61 @@ struct RootView: View {
     @StateObject private var settings = RASettingsStore()
     @StateObject private var pip = PiPPlayerManager()
     @StateObject private var history = HistoryStore()
+    @StateObject private var engine = DraftEngine()
+    @StateObject private var live = LiveStore()
+    @StateObject private var router = AppRouter()
+    @AppStorage("pb_last_cc") private var lastPasteboardCC: Int = -1
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
-        TabView {
+        TabView(selection: $router.tab) {
             DraftView()
                 .tabItem { Label("起草", systemImage: "text.bubble.fill") }
+                .tag(0)
+            AskView()
+                .tabItem { Label("问问AI", systemImage: "questionmark.bubble.fill") }
+                .tag(1)
+            ToolboxView()
+                .tabItem { Label("工具箱", systemImage: "square.grid.2x2.fill") }
+                .tag(2)
             HistoryView()
                 .tabItem { Label("历史", systemImage: "clock.arrow.circlepath") }
+                .tag(3)
             RASettingsView()
                 .tabItem { Label("设置", systemImage: "gearshape.fill") }
+                .tag(4)
         }
         .environmentObject(settings)
         .environmentObject(pip)
         .environmentObject(history)
+        .environmentObject(engine)
+        .environmentObject(live)
+        .environmentObject(router)
         .accentColor(settings.themeValue.accent)
+        .onAppear {
+            if lastPasteboardCC == -1 { lastPasteboardCC = UIPasteboard.general.changeCount }
+            live.onNewDraft = { payload in
+                history.add(intent: "直播 · 对方说：" + String(payload.otherText.prefix(12)), candidates: payload.candidates)
+            }
+            live.start()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                live.checkInbox()
+                autoImportIfNeeded()
+            }
+        }
+    }
+
+    private func autoImportIfNeeded() {
+        guard settings.autoImport else { return }
+        let pb = UIPasteboard.general
+        let cc = pb.changeCount
+        if cc == lastPasteboardCC { return }
+        lastPasteboardCC = cc
+        if pb.hasImages, let img = pb.image {
+            Task { await engine.processImage(img) }
+        }
     }
 }
 
@@ -498,6 +540,91 @@ struct BroadcastPickerView: UIViewRepresentable {
     func updateUIView(_ v: RPSystemBroadcastPickerView, context: Context) {}
 }
 
+// MARK: - 分页路由与直播中枢
+
+final class AppRouter: ObservableObject {
+    @Published var tab: Int = 0
+}
+
+/// 直播状态中枢：收件箱、心跳、诊断、通知中继都归这里管
+final class LiveStore: ObservableObject {
+    @Published var inbox: DraftPayload? = nil
+    @Published var extAlive = false
+    @Published var diagText = ""
+    @Published var notifDenied = false
+    var onNewDraft: ((DraftPayload) -> Void)? = nil
+    private let darwin = DarwinWatcher()
+    private var started = false
+    private var lastDraftID: String {
+        get { UserDefaults.standard.string(forKey: "ra_last_draft_id") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "ra_last_draft_id") }
+    }
+
+    func start() {
+        if started { return }
+        started = true
+        darwin.onSignal = { [weak self] in self?.checkInbox(fromSignal: true) }
+        darwin.start()
+        checkInbox()
+    }
+
+    func checkInbox(fromSignal: Bool = false) {
+        refreshStatus()
+        guard let raw = KeychainHelper.get("draft_latest"),
+              let data = raw.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(DraftPayload.self, from: data) else { return }
+        if payload.id != lastDraftID {
+            inbox = payload
+            lastDraftID = payload.id
+            onNewDraft?(payload)
+            if fromSignal && UIApplication.shared.applicationState != .active {
+                let content = UNMutableNotificationContent()
+                content.title = "AI 回话建议 · 对方说「" + String(payload.otherText.prefix(10)) + "」"
+                content.body = payload.candidates.first ?? ""
+                content.sound = .default
+                content.categoryIdentifier = "DRAFT_CAT"
+                let req = UNNotificationRequest(identifier: payload.id, content: content, trigger: nil)
+                UNUserNotificationCenter.current().add(req)
+            }
+        }
+    }
+
+    func clearInbox() { inbox = nil }
+
+    func refreshStatus() {
+        if let raw = KeychainHelper.get("ext_heartbeat"), let t = Double(raw) {
+            extAlive = Date().timeIntervalSince1970 - t < 150
+        } else {
+            extAlive = false
+        }
+        if let raw = KeychainHelper.get("ext_status"),
+           let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            diagText = fmtDiag(obj)
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            DispatchQueue.main.async { self.notifDenied = (s.authorizationStatus == .denied) }
+        }
+    }
+
+    private func fmtDiag(_ st: [String: Any]) -> String {
+        func t(_ k: String) -> String {
+            guard let v = st[k] as? NSNumber else { return "—" }
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm:ss"
+            return f.string(from: Date(timeIntervalSince1970: v.doubleValue))
+        }
+        let frames = (st["frames"] as? NSNumber)?.intValue ?? 0
+        let ocr = (st["ocrRuns"] as? NSNumber)?.intValue ?? 0
+        let lines = (st["lastLines"] as? NSNumber)?.intValue ?? 0
+        let drafts = (st["drafts"] as? NSNumber)?.intValue ?? 0
+        let err = (st["lastErr"] as? String) ?? ""
+        var s = "诊断：处理帧 \(frames) · 识别 \(ocr) 次（最近 \(t("lastOcrAt"))，读到 \(lines) 行）· 成功起草 \(drafts) 次"
+        if !err.isEmpty { s += "\n最近错误：" + err }
+        return s
+    }
+}
+
 // MARK: - 起草引擎状态
 
 final class DraftEngine: ObservableObject {
@@ -544,7 +671,7 @@ final class DraftEngine: ObservableObject {
         do {
             askAnswer = try await AIClient.ask(apiKey: key, model: settings.model, transcript: transcriptText(lines), question: question)
         } catch {
-            askAnswer = "出错了：" + String(describing: error)
+            askAnswer = AIClient.describe(error)
         }
     }
 
@@ -617,42 +744,59 @@ extension View {
     func raCard() -> some View { modifier(RACard()) }
 }
 
+// MARK: - 通用页头
+
+struct PageHeader: View {
+    let icon: String
+    let title: String
+    let sub: String
+    @EnvironmentObject var settings: RASettingsStore
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 22)).foregroundColor(.white)
+                .frame(width: 46, height: 46)
+                .background(Color.white.opacity(0.22))
+                .clipShape(RoundedRectangle(cornerRadius: 13))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline).foregroundColor(.white)
+                Text(sub).font(.caption2).foregroundColor(.white.opacity(0.88)).lineLimit(2)
+            }
+            Spacer()
+        }
+        .padding(14)
+        .background(settings.themeValue.gradient)
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .shadow(color: .black.opacity(0.10), radius: 8, x: 0, y: 3)
+    }
+}
+
 // MARK: - 起草页
 
 struct DraftView: View {
-    @StateObject private var engine = DraftEngine()
+    @EnvironmentObject var engine: DraftEngine
     @EnvironmentObject var settings: RASettingsStore
     @EnvironmentObject var pip: PiPPlayerManager
     @EnvironmentObject var history: HistoryStore
+    @EnvironmentObject var live: LiveStore
+    @EnvironmentObject var router: AppRouter
     @State private var showPicker = false
     @State private var copiedIndex: Int? = nil
     @State private var lastSaved: [String] = []
-    @StateObject private var darwin = DarwinWatcher()
-    @State private var inbox: DraftPayload? = nil
-    @State private var extAlive = false
-    @State private var diagText: String = ""
-    @State private var notifDenied = false
-    @AppStorage("ra_last_draft_id") private var lastDraftID: String = ""
-    @AppStorage("pb_last_cc") private var lastPasteboardCC: Int = -1
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 16) {
                     headerCard
-                    broadcastCard
+                    quickNav
                     materialCard
                     intentToneCard
-                    askCard
                     draftButton
                     if !engine.errorText.isEmpty {
                         Text(engine.errorText)
                             .font(.caption).foregroundColor(.red)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    if let payload = inbox {
-                        inboxSection(payload)
                     }
                     if !engine.candidates.isEmpty {
                         stageCard
@@ -662,247 +806,15 @@ struct DraftView: View {
                 .padding(16)
             }
             .background(LinearGradient(colors: [settings.themeValue.accent.opacity(0.13), Color(.systemGroupedBackground)], startPoint: .top, endPoint: .center).ignoresSafeArea())
-            .navigationTitle("回话助手")
+            .navigationTitle("起草")
+            .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showPicker) {
                 PhotoPicker { img in
                     Task { await engine.processImage(img) }
                 }
             }
-            .onAppear {
-                if lastPasteboardCC == -1 { lastPasteboardCC = UIPasteboard.general.changeCount }
-                darwin.onSignal = { checkInbox(fromSignal: true) }
-                darwin.start()
-                checkInbox()
-            }
-            .onChange(of: scenePhase) { phase in
-                if phase == .active {
-                    checkInbox()
-                    autoImportIfNeeded()
-                }
-            }
         }
         .navigationViewStyle(.stack)
-    }
-
-    private var askCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "questionmark.bubble")
-                    .foregroundColor(settings.themeValue.accent)
-                Text("问问 AI").font(.subheadline.weight(.bold))
-                Spacer()
-                Picker("", selection: $engine.askMode) {
-                    Text("问问").tag(0)
-                    Text("润色我的话").tag(1)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 176)
-            }
-            if engine.askMode == 0 {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(["她这句什么意思？", "怎么回显得高情商？", "帮我想个俏皮的回法", "这话该怎么接？"], id: \.self) { q in
-                            Button(q) { engine.askText = q }
-                                .font(.caption2)
-                                .buttonStyle(.bordered)
-                                .tint(settings.themeValue.accent)
-                        }
-                    }
-                }
-            }
-            TextField(engine.askMode == 0 ? "想问 AI 什么，写在这里" : "把你想说的话写这里，AI 帮你润色", text: $engine.askText)
-                .textFieldStyle(.roundedBorder)
-            Button {
-                Task { await engine.runAsk(settings: settings) }
-            } label: {
-                HStack {
-                    if engine.askRunning { ProgressView() }
-                    Text(engine.askRunning ? "AI 正在想…" : (engine.askMode == 0 ? "问 AI" : "帮我润色"))
-                        .font(.subheadline.weight(.bold))
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(settings.themeValue.accent)
-            .disabled(engine.askRunning)
-            if !engine.askAnswer.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(engine.askAnswer)
-                        .font(.subheadline)
-                        .textSelection(.enabled)
-                    HStack {
-                        Button {
-                            UIPasteboard.general.string = engine.askAnswer
-                            UINotificationFeedbackGenerator().notificationOccurred(.success)
-                        } label: {
-                            Label("复制", systemImage: "doc.on.doc").font(.caption)
-                        }
-                        .buttonStyle(.plain).foregroundColor(.teal)
-                        Spacer()
-                        Button("收起") { engine.askAnswer = "" }
-                            .font(.caption).foregroundColor(.secondary)
-                    }
-                }
-                .padding(10)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
-        }
-        .raCard()
-    }
-
-    private var broadcastCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: "record.circle")
-                    .foregroundColor(extAlive ? .red : .secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("直播助手 · 全自动").font(.subheadline.weight(.bold))
-                    Text(extAlive ? "已连接：正盯着屏幕，对方发消息自动起草" : "未连接：开播后对方发消息会自动起草并通知你")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-                Spacer()
-                BroadcastPickerView().frame(width: 52, height: 52)
-            }
-            Text("点右侧按钮选「回话助手」开始直播（或控制中心长按屏幕录制）。直播中对方发来消息，几秒后建议会推送通知，也会出现在这里下方。第一次先授权通知。")
-                .font(.caption2).foregroundColor(.secondary)
-            HStack(spacing: 14) {
-                Button("授权通知") {
-                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
-                        DispatchQueue.main.async { refreshHeartbeat() }
-                    }
-                }
-                .font(.caption).tint(settings.themeValue.accent)
-                Button("发一条测试通知") {
-                    let content = UNMutableNotificationContent()
-                    content.title = "测试通知"
-                    content.body = "能看到这条，说明通知通道没问题"
-                    content.sound = .default
-                    let req = UNNotificationRequest(identifier: "test-" + UUID().uuidString, content: content,
-                                                    trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
-                    UNUserNotificationCenter.current().add(req)
-                }
-                .font(.caption).tint(settings.themeValue.accent)
-            }
-            if notifDenied {
-                Text("通知被系统关掉了：去 设置 → 通知 → 回话助手 打开，否则建议只能回 App 里看")
-                    .font(.caption2).foregroundColor(.red)
-            }
-            if !diagText.isEmpty {
-                Text(diagText)
-                    .font(.caption2).foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-        }
-        .raCard()
-    }
-
-    private func inboxSection(_ payload: DraftPayload) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
-                Image(systemName: "dot.radiowaves.left.and.right")
-                    .foregroundColor(settings.themeValue.accent)
-                Text("直播建议").font(.subheadline.weight(.bold))
-                Spacer()
-                Button("关闭") { inbox = nil }
-                    .font(.caption).tint(.secondary)
-            }
-            Text("对方说：「\(payload.otherText)」")
-                .font(.caption).foregroundColor(.secondary).lineLimit(2)
-            ForEach(Array(payload.candidates.enumerated()), id: \.offset) { _, cand in
-                HStack(spacing: 8) {
-                    Text(cand).font(.subheadline)
-                    Spacer()
-                    Button {
-                        UIPasteboard.general.string = cand
-                        UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                    }
-                    .buttonStyle(.plain).foregroundColor(.teal)
-                }
-                .padding(10)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
-            Button {
-                pip.prepareAndFloatLines(payload.candidates, theme: settings.themeValue)
-            } label: {
-                Label("三条一起悬浮", systemImage: "pip.enter")
-                    .font(.caption.weight(.bold))
-            }
-            .buttonStyle(.bordered)
-            .tint(settings.themeValue.accent)
-        }
-        .raCard()
-    }
-
-    private func checkInbox(fromSignal: Bool = false) {
-        refreshHeartbeat()
-        guard let raw = KeychainHelper.get("draft_latest"),
-              let data = raw.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(DraftPayload.self, from: data) else { return }
-        if payload.id != lastDraftID {
-            inbox = payload
-            history.add(intent: "直播 · 对方说：" + String(payload.otherText.prefix(12)), candidates: payload.candidates)
-            lastDraftID = payload.id
-            if fromSignal && UIApplication.shared.applicationState != .active {
-                let content = UNMutableNotificationContent()
-                content.title = "AI 回话建议 · 对方说「" + String(payload.otherText.prefix(10)) + "」"
-                content.body = payload.candidates.first ?? ""
-                content.sound = .default
-                content.categoryIdentifier = "DRAFT_CAT"
-                let req = UNNotificationRequest(identifier: payload.id, content: content, trigger: nil)
-                UNUserNotificationCenter.current().add(req)
-            }
-        }
-    }
-
-    private func refreshHeartbeat() {
-        if let raw = KeychainHelper.get("ext_heartbeat"), let t = Double(raw) {
-            extAlive = Date().timeIntervalSince1970 - t < 150
-        } else {
-            extAlive = false
-        }
-        if let raw = KeychainHelper.get("ext_status"),
-           let data = raw.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            diagText = fmtDiag(obj)
-        }
-        UNUserNotificationCenter.current().getNotificationSettings { s in
-            DispatchQueue.main.async { notifDenied = (s.authorizationStatus == .denied) }
-        }
-    }
-
-    private func fmtDiag(_ st: [String: Any]) -> String {
-        func t(_ k: String) -> String {
-            guard let v = st[k] as? NSNumber else { return "—" }
-            let f = DateFormatter()
-            f.dateFormat = "HH:mm:ss"
-            return f.string(from: Date(timeIntervalSince1970: v.doubleValue))
-        }
-        let frames = (st["frames"] as? NSNumber)?.intValue ?? 0
-        let ocr = (st["ocrRuns"] as? NSNumber)?.intValue ?? 0
-        let lines = (st["lastLines"] as? NSNumber)?.intValue ?? 0
-        let drafts = (st["drafts"] as? NSNumber)?.intValue ?? 0
-        let err = (st["lastErr"] as? String) ?? ""
-        var s = "诊断：处理帧 \(frames) · 识别 \(ocr) 次（最近 \(t("lastOcrAt"))，读到 \(lines) 行）· 成功起草 \(drafts) 次"
-        if !err.isEmpty { s += "\n最近错误：" + err }
-        return s
-    }
-
-    private func autoImportIfNeeded() {
-        guard settings.autoImport else { return }
-        let pb = UIPasteboard.general
-        let cc = pb.changeCount
-        if cc == lastPasteboardCC { return }
-        lastPasteboardCC = cc
-        if pb.hasImages, let img = pb.image {
-            Task { await engine.processImage(img) }
-        }
     }
 
     private var headerCard: some View {
@@ -933,6 +845,31 @@ struct DraftView: View {
         .background(settings.themeValue.gradient)
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 4)
+    }
+
+    private var quickNav: some View {
+        HStack(spacing: 10) {
+            quickTile(icon: "questionmark.bubble.fill", title: "问问 AI", sub: "答疑 · 润色", tab: 1)
+            quickTile(icon: "dot.radiowaves.left.and.right", title: "直播助手", sub: live.extAlive ? "已连接" : "未连接", tab: 2)
+            quickTile(icon: "keyboard.fill", title: "回话键盘", sub: "在工具箱开启", tab: 2)
+        }
+    }
+
+    private func quickTile(icon: String, title: String, sub: String, tab: Int) -> some View {
+        Button { router.tab = tab } label: {
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 17))
+                    .foregroundColor(settings.themeValue.accent)
+                Text(title).font(.caption.weight(.bold)).foregroundColor(.primary)
+                Text(sub).font(.caption2).foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity).padding(.vertical, 10)
+            .background(Color(.systemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .shadow(color: .black.opacity(0.05), radius: 6, x: 0, y: 2)
+        }
+        .buttonStyle(.plain)
     }
 
     private var materialCard: some View {
@@ -1001,7 +938,6 @@ struct DraftView: View {
         }
         .raCard()
     }
-
     private var intentToneCard: some View {
         VStack(alignment: .leading, spacing: 11) {
             Label("你想表达", systemImage: "pencil.line")
@@ -1048,10 +984,13 @@ struct DraftView: View {
                     miniChip(l, selected: settings.length == l) { settings.length = l }
                 }
                 Spacer()
+            }
+            HStack(spacing: 6) {
                 Text("条数").font(.caption).foregroundColor(.secondary)
                 ForEach([3, 5], id: \.self) { n in
                     miniChip("\(n) 条", selected: settings.draftCount == n) { settings.draftCount = n }
                 }
+                Spacer()
             }
         }
         .raCard()
@@ -1192,6 +1131,304 @@ struct DraftView: View {
             Color(red: 0.990, green: 0.935, blue: 0.950),
         ]
         return tints[idx % tints.count]
+    }
+}
+
+// MARK: - 问问 AI 页
+
+struct AskView: View {
+    @EnvironmentObject var engine: DraftEngine
+    @EnvironmentObject var settings: RASettingsStore
+    @EnvironmentObject var pip: PiPPlayerManager
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 16) {
+                    PageHeader(icon: "questionmark.bubble.fill", title: "问问 AI",
+                               sub: engine.lines.isEmpty ? "没导入对话时，按你的问题独立作答" : "会结合起草页的对话记录（\(engine.lines.filter { $0.speaker != .system }.count) 条）作答")
+                    askMainCard
+                    if !engine.askAnswer.isEmpty {
+                        answerCard
+                    }
+                }
+                .padding(16)
+            }
+            .background(LinearGradient(colors: [settings.themeValue.accent.opacity(0.13), Color(.systemGroupedBackground)], startPoint: .top, endPoint: .center).ignoresSafeArea())
+            .navigationTitle("问问 AI")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private var askMainCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("", selection: $engine.askMode) {
+                Text("问问题").tag(0)
+                Text("润色我的话").tag(1)
+            }
+            .pickerStyle(.segmented)
+            if engine.askMode == 0 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(["她这句什么意思？", "怎么回显得高情商？", "帮我想个俏皮的回法", "这话该怎么接？", "帮我分析她的语气"], id: \.self) { q in
+                            Button(q) { engine.askText = q }
+                                .font(.caption)
+                                .buttonStyle(.bordered)
+                                .tint(settings.themeValue.accent)
+                        }
+                    }
+                }
+                Text("想问什么就写什么，AI 会结合对话记录回答。")
+                    .font(.caption2).foregroundColor(.secondary)
+            } else {
+                Text("把你想说的话原样写下来，AI 只动说法、不动意思。")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            TextEditor(text: $engine.askText)
+                .frame(height: 96)
+                .padding(4)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            Button {
+                Task { await engine.runAsk(settings: settings) }
+            } label: {
+                HStack {
+                    if engine.askRunning { ProgressView().tint(.white) }
+                    Image(systemName: engine.askMode == 0 ? "questionmark.bubble" : "wand.and.stars")
+                    Text(engine.askRunning ? "AI 正在想…" : (engine.askMode == 0 ? "问 AI" : "帮我润色"))
+                        .font(.headline)
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity).padding(.vertical, 12)
+                .background(settings.themeValue.gradient)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+            }
+            .disabled(engine.askRunning)
+        }
+        .raCard()
+    }
+
+    private var answerCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles").foregroundColor(settings.themeValue.accent)
+                Text(engine.askMode == 1 ? "润色结果" : "AI 的回答")
+                    .font(.subheadline.weight(.bold))
+                Spacer()
+                Button("收起") { engine.askAnswer = "" }
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            if engine.askMode == 1 {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("原文").font(.caption2).foregroundColor(.secondary)
+                    Text(engine.askText).font(.caption).foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            Text(engine.askAnswer)
+                .font(.body)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 10) {
+                Button {
+                    UIPasteboard.general.string = engine.askAnswer
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                } label: {
+                    Label("复制", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    pip.prepareAndFloat(text: engine.askAnswer, theme: settings.themeValue)
+                } label: {
+                    Label("悬浮显示", systemImage: "pip.enter")
+                }
+                .buttonStyle(.bordered)
+                .tint(settings.themeValue.accent)
+                Spacer()
+            }
+            .font(.subheadline)
+        }
+        .raCard()
+    }
+}
+
+// MARK: - 工具箱页（直播 + 收件箱 + 键盘）
+
+struct ToolboxView: View {
+    @EnvironmentObject var settings: RASettingsStore
+    @EnvironmentObject var pip: PiPPlayerManager
+    @EnvironmentObject var live: LiveStore
+    @State private var plugins: [(String, Bool)] = []
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(spacing: 16) {
+                    PageHeader(icon: "square.grid.2x2.fill", title: "工具箱", sub: "直播助手、直播建议、回话键盘都在这里")
+                    broadcastCard
+                    if let payload = live.inbox {
+                        inboxSection(payload)
+                    }
+                    keyboardCard
+                }
+                .padding(16)
+            }
+            .background(LinearGradient(colors: [settings.themeValue.accent.opacity(0.13), Color(.systemGroupedBackground)], startPoint: .top, endPoint: .center).ignoresSafeArea())
+            .navigationTitle("工具箱")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                refreshPlugins()
+                live.refreshStatus()
+            }
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private var broadcastCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "record.circle")
+                    .foregroundColor(live.extAlive ? .red : .secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("直播助手 · 全自动").font(.subheadline.weight(.bold))
+                    Text(live.extAlive ? "已连接：正盯着屏幕，对方发消息自动起草" : "未连接：开播后对方发消息会自动起草并通知你")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer()
+                BroadcastPickerView().frame(width: 52, height: 52)
+            }
+            Text("点右侧按钮选「回话助手」开始直播（或控制中心长按屏幕录制）。对方发来新消息，几秒后建议会推送通知，也会出现在下方收件箱。")
+                .font(.caption2).foregroundColor(.secondary)
+            HStack(spacing: 14) {
+                Button("授权通知") {
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+                        DispatchQueue.main.async { live.refreshStatus() }
+                    }
+                }
+                .font(.caption).tint(settings.themeValue.accent)
+                Button("发一条测试通知") {
+                    let content = UNMutableNotificationContent()
+                    content.title = "测试通知"
+                    content.body = "能看到这条，说明通知通道没问题"
+                    content.sound = .default
+                    let req = UNNotificationRequest(identifier: "test-" + UUID().uuidString, content: content,
+                                                    trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
+                    UNUserNotificationCenter.current().add(req)
+                }
+                .font(.caption).tint(settings.themeValue.accent)
+                Button("刷新诊断") { live.refreshStatus() }
+                    .font(.caption).tint(settings.themeValue.accent)
+            }
+            if live.notifDenied {
+                Text("通知被系统关掉了：去 设置 → 通知 → 回话助手 打开，否则建议只能回 App 里看")
+                    .font(.caption2).foregroundColor(.red)
+            }
+            if !live.diagText.isEmpty {
+                Text(live.diagText)
+                    .font(.caption2).foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .raCard()
+    }
+
+    private func inboxSection(_ payload: DraftPayload) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .foregroundColor(settings.themeValue.accent)
+                Text("直播建议").font(.subheadline.weight(.bold))
+                Spacer()
+                Button("关闭") { live.clearInbox() }
+                    .font(.caption).tint(.secondary)
+            }
+            Text("对方说：「\(payload.otherText)」")
+                .font(.caption).foregroundColor(.secondary).lineLimit(2)
+            ForEach(Array(payload.candidates.enumerated()), id: \.offset) { _, cand in
+                HStack(spacing: 8) {
+                    Text(cand).font(.subheadline)
+                    Spacer()
+                    Button {
+                        UIPasteboard.general.string = cand
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.plain).foregroundColor(.teal)
+                }
+                .padding(10)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            Button {
+                pip.prepareAndFloatLines(payload.candidates, theme: settings.themeValue)
+            } label: {
+                Label("三条一起悬浮", systemImage: "pip.enter")
+                    .font(.caption.weight(.bold))
+            }
+            .buttonStyle(.bordered)
+            .tint(settings.themeValue.accent)
+        }
+        .raCard()
+    }
+
+    private var keyboardCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "keyboard.fill")
+                    .foregroundColor(settings.themeValue.accent)
+                Text("回话键盘").font(.subheadline.weight(.bold))
+                Spacer()
+                Button("重新检测") { refreshPlugins() }
+                    .font(.caption).tint(settings.themeValue.accent)
+            }
+            ForEach(plugins, id: \.0) { item in
+                HStack(spacing: 6) {
+                    Image(systemName: item.1 ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                        .foregroundColor(item.1 ? .green : .red)
+                    Text(item.0 == "ReplyKeyboard.appex" ? "键盘组件" : "直播组件")
+                        .font(.caption.weight(.bold))
+                    Text(item.1 ? "已装进这个包" : "不在包里！")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            if plugins.contains(where: { !$0.1 }) {
+                Text("组件不在包里，多半是签名工具在安装时把扩展移除了。重装时把签名工具里的「移除插件 / 精简扩展」类选项关掉，再装一次，键盘就会出现。")
+                    .font(.caption2).foregroundColor(.red)
+            } else {
+                Text("组件都在包里。开启方法：设置 → 通用 → 键盘 → 键盘 → 添加新键盘 → 选「回话键盘」；再点进「回话键盘」打开「允许完全访问」（不开，键盘里联网和读剪贴板都用不了）。装好后在聊天里点地球键就能切过去。")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            HStack(spacing: 14) {
+                Button("试着打开键盘设置") {
+                    if let url = URL(string: "App-prefs:root=General&path=Keyboard/KEYBOARDS") {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                .font(.caption).tint(settings.themeValue.accent)
+            }
+            Divider()
+            Toggle("打开 App 时自动导入剪贴板截图", isOn: $settings.autoImport)
+                .font(.caption)
+        }
+        .raCard()
+    }
+
+    private func refreshPlugins() {
+        let want = ["ReplyKeyboard.appex", "ReplyBroadcast.appex"]
+        var found: [String] = []
+        if let url = Bundle.main.builtInPlugInsURL,
+           let items = try? FileManager.default.contentsOfDirectory(atPath: url.path) {
+            found = items
+        }
+        plugins = want.map { ($0, found.contains($0)) }
     }
 }
 
@@ -1458,7 +1695,7 @@ struct RASettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Section(header: Text("关于")) {
-                    HStack { Text("版本"); Spacer(); Text("3.0.0").foregroundColor(.secondary) }
+                    HStack { Text("版本"); Spacer(); Text("4.0.0").foregroundColor(.secondary) }
                     HStack { Text("开发者"); Spacer(); Text("LengMo").foregroundColor(.secondary) }
                     Text("© 2026 LengMo").font(.caption).foregroundColor(.secondary)
                 }

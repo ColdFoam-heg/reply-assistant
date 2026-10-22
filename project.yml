@@ -1,0 +1,28 @@
+name: ReplyAssistant
+options:
+  bundleIdPrefix: com.lengmo
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  ReplyAssistant:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+    settings:
+      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      SWIFT_VERSION: "5.0"
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: "回话助手"
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        NSHumanReadableCopyright: "© 2026 LengMo"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSPhotoLibraryUsageDescription: "选择聊天截图，用本地 OCR 提取对话给 AI 起草回复"
+        UIBackgroundModes:
+          - audio

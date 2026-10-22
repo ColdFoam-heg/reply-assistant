@@ -13,6 +13,8 @@ targets:
     dependencies:
       - target: ReplyBroadcast
         embed: true
+      - target: ReplyKeyboard
+        embed: true
     settings:
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       SWIFT_VERSION: "5.0"
@@ -21,8 +23,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: "回话助手"
-        CFBundleShortVersionString: "2.0.0"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "3.0.0"
+        CFBundleVersion: "5"
         NSHumanReadableCopyright: "© 2026 LengMo"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -47,3 +49,23 @@ targets:
           NSExtensionPointIdentifier: com.apple.broadcast-services-upload
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).SampleHandler"
         RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+  ReplyKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: KeySources
+      - path: Sources/Shared.swift
+    settings:
+      SWIFT_VERSION: "5.0"
+      PRODUCT_BUNDLE_IDENTIFIER: com.lengmo.ReplyAssistant.ReplyKeyboard
+    info:
+      path: KeySources/Info.plist
+      properties:
+        CFBundleDisplayName: "回话键盘"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.keyboard
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).KeyboardViewController"
+          NSExtensionAttributes:
+            IsASCIICapable: false
+            PrimaryLanguage: "zh-Hans"
+            RequestsOpenAccess: true

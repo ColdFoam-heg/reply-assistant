@@ -194,8 +194,8 @@ req.httpMethod = "POST"
 req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 let system = "你是一个高情商的回话参谋，帮用户回复聊天消息。根据对话记录和用户想表达的意思，起草 3 条可以直接发送的回复候选。要求：三条风格有明显区别；自然口语，像真人打字聊天；长度贴合聊天场景；不要解释、不要加前后缀，只输出 3 行，每行一条，格式为「1. 内容」「2. 内容」「3. 内容」。"
-let intentText = intent.isEmpty? "顺着对方最后一句自然接话": intent
-let user = "\n\(transcript)\n\n\(intentText)\n\(tone)"
+let intentText = intent.isEmpty ? "顺着对方最后一句自然接话" : intent
+let user = "【对话记录】\n\(transcript)\n\n【我想表达】\(intentText)\n【语气基调】\(tone)"
 let body: [String: Any] = [
 "model": model,
 "messages": [
@@ -250,7 +250,7 @@ private var currentText: String = ""
 private var frameNo: Int64 = 0
 
 private func ensureController() -> Bool {
-if pip!= nil { return true}
+if pip != nil { return true }
 guard AVPictureInPictureController.isPictureInPictureSupported() else {
 lastError = "这台设备不支持画中画"
 return false

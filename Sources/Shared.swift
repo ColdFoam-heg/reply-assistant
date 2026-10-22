@@ -47,7 +47,7 @@ struct DraftPayload: Codable {
 }
 
 enum RAConstants {
-    static let defaultModel = "minimax/minimax-m3.1-flash:free"
+    static let defaultModel = "google/gemma-4-31b-it:free"
     static let tones: [String] = ["自然接话", "温柔体贴", "幽默风趣", "直截了当", "正式礼貌", "自定义"]
     static let toneIcons: [String] = ["text.bubble", "heart.fill", "face.smiling", "bolt.fill", "briefcase.fill", "slider.horizontal.3"]
     static let partners: [String] = ["不指定", "女朋友", "朋友", "家人", "领导", "客户"]
@@ -61,12 +61,12 @@ enum RAConstants {
     ]
     /// 精选免费模型（来自 2026-10-22 免费模型扫描，聊天向）
     static let curatedFree: [String] = [
-        "minimax/minimax-m3.1-flash:free",
-        "recursive/flint-v1.0:free",
-        "openrouter/free",
-        "thinkingmachines/inkling:free",
         "google/gemma-4-31b-it:free",
+        "thinkingmachines/inkling:free",
+        "openrouter/free",
+        "recursive/flint-v1.0:free",
         "nvidia/nemotron-3-super-120b-a12b:free",
+        "google/gemma-4-26b-a4b-it:free",
         "poolside/laguna-s-2.1:free",
         "xingchen-agi/xing4.0-29b-a4b:free",
     ]
@@ -198,16 +198,46 @@ return lines
 enum AIError: LocalizedError {
 case http(Int, String)
 case empty
-var errorDescription: String? {
+var friendly: String {
 switch self {
-case.http(let code, let msg): return "接口返回 \(code)：\(msg)"
-case.empty: return "模型没有返回内容，换个模型或稍后再试"
+case .http(let code, _):
+switch code {
+case 404: return "这个模型已被 OpenRouter 下线，去「设置 → 模型」换一个；起草时会自动先拿默认模型顶一次"
+case 401: return "Key 无效或已过期，去「设置」里检查 OpenRouter Key"
+case 402: return "这个模型要扣费或余额不足，换一个带「免费」徽章的模型"
+case 429: return "请求太频繁，或者今天的免费额度用完了，过一会儿再试"
+default: return "服务出错了（\(code)），稍后再试"
+}
+case .empty: return "模型没返回内容，换个模型或稍后再试"
 }
 }
+var errorDescription: String? { friendly }
 }
 
 enum AIClient {
+static func describe(_ error: Error) -> String {
+if let e = error as? AIError { return e.friendly }
+if error is URLError { return "网络出问题了，检查一下网络再试" }
+return "出错了，稍后再试"
+}
+
+static func isModelGone(_ error: Error) -> Bool {
+guard let e = error as? AIError, case .http(let code, _) = e else { return false }
+return code == 404
+}
+
 static func draft(apiKey: String, model: String, transcript: String, intent: String, tone: String, partner: String, length: String, count: Int) async throws -> [String] {
+do {
+return try await draftOnce(apiKey: apiKey, model: model, transcript: transcript, intent: intent, tone: tone, partner: partner, length: length, count: count)
+} catch {
+if isModelGone(error), model != RAConstants.defaultModel {
+return try await draftOnce(apiKey: apiKey, model: RAConstants.defaultModel, transcript: transcript, intent: intent, tone: tone, partner: partner, length: length, count: count)
+}
+throw error
+}
+}
+
+static func draftOnce(apiKey: String, model: String, transcript: String, intent: String, tone: String, partner: String, length: String, count: Int) async throws -> [String] {
 let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 var req = URLRequest(url: url, timeoutInterval: 60)
 req.httpMethod = "POST"
@@ -259,6 +289,17 @@ return cands
 }
 
 static func ask(apiKey: String, model: String, transcript: String, question: String) async throws -> String {
+do {
+return try await askOnce(apiKey: apiKey, model: model, transcript: transcript, question: question)
+} catch {
+if isModelGone(error), model != RAConstants.defaultModel {
+return try await askOnce(apiKey: apiKey, model: RAConstants.defaultModel, transcript: transcript, question: question)
+}
+throw error
+}
+}
+
+static func askOnce(apiKey: String, model: String, transcript: String, question: String) async throws -> String {
 let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 var req = URLRequest(url: url)
 req.httpMethod = "POST"

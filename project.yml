@@ -10,15 +10,19 @@ targets:
     sources:
       - path: Sources
       - path: Assets.xcassets
+    dependencies:
+      - target: ReplyBroadcast
+        embed: true
     settings:
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       SWIFT_VERSION: "5.0"
+      PRODUCT_BUNDLE_IDENTIFIER: com.lengmo.ReplyAssistant
     info:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: "回话助手"
-        CFBundleShortVersionString: "1.2.0"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "2.0.0"
+        CFBundleVersion: "4"
         NSHumanReadableCopyright: "© 2026 LengMo"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
@@ -26,3 +30,20 @@ targets:
         NSPhotoLibraryUsageDescription: "选择聊天截图，用本地 OCR 提取对话给 AI 起草回复"
         UIBackgroundModes:
           - audio
+  ReplyBroadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ExtSources
+      - path: Sources/Shared.swift
+    settings:
+      SWIFT_VERSION: "5.0"
+      PRODUCT_BUNDLE_IDENTIFIER: com.lengmo.ReplyAssistant.ReplyBroadcast
+    info:
+      path: ExtSources/Info.plist
+      properties:
+        CFBundleDisplayName: "回话直播"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).SampleHandler"
+        RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer

@@ -157,7 +157,7 @@ final class KBModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.running = false
-                    self.status = "起草失败：" + String(describing: error)
+                    self.status = "起草失败：" + AIClient.describe(error)
                 }
             }
         }
@@ -184,7 +184,7 @@ final class KBModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.running = false
-                    self.status = "提问失败：" + String(describing: error)
+                    self.status = "提问失败：" + AIClient.describe(error)
                 }
             }
         }

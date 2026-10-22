@@ -451,7 +451,7 @@ struct PhotoPicker: UIViewControllerRepresentable {
                   provider.canLoadObject(ofClass: UIImage.self) else { return }
             provider.loadObject(ofClass: UIImage.self) { obj, _ in
                 if let img = obj as? UIImage {
-                    DispatchQueue.main.async { parent.onPick(img) }
+                    DispatchQueue.main.async { self.parent.onPick(img) }
                 }
             }
         }

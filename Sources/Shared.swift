@@ -258,6 +258,44 @@ if cands.isEmpty { throw AIError.empty}
 return cands
 }
 
+static func ask(apiKey: String, model: String, transcript: String, question: String) async throws -> String {
+let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+var req = URLRequest(url: url)
+req.httpMethod = "POST"
+req.setValue("Bearer " + apiKey, forHTTPHeaderField: "Authorization")
+req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+req.timeoutInterval = 45
+let sys = "你是中文聊天回话助手。结合对话记录回答用户的问题：简洁、直接、有用，不客套、不编号、不用标题。若用户让你润色句子，只输出润色后的那句话。"
+var user = ""
+if !transcript.isEmpty { user += "【对话记录】\n" + transcript + "\n\n" }
+user += "【用户的问题】\n" + question
+let body: [String: Any] = [
+"model": model,
+"messages": [
+["role": "system", "content": sys],
+["role": "user", "content": user],
+],
+"temperature": 0.6,
+"max_tokens": 500,
+]
+req.httpBody = try JSONSerialization.data(withJSONObject: body)
+let cfg = URLSessionConfiguration.ephemeral
+cfg.timeoutIntervalForRequest = 45
+let (data, resp) = try await URLSession(configuration: cfg).data(for: req)
+let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+guard code == 200 else {
+let msg = String(data: data, encoding: .utf8) ?? ""
+throw AIError.http(code, String(msg.prefix(160)))
+}
+guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+let choices = obj["choices"] as? [[String: Any]],
+let message = choices.first?["message"] as? [String: Any],
+let content = message["content"] as? String else {
+throw AIError.empty
+}
+return content.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 static func lengthHint(_ length: String) -> String {
         switch length {
         case "短句": return "短句，每条尽量 15 字以内"

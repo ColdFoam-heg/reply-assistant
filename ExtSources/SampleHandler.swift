@@ -241,7 +241,7 @@ class SampleHandler: RPBroadcastSampleHandler {
                        body: cands.first ?? "", category: "DRAFT_CAT")
             } catch {
                 self.queue.async {
-                    self.status["lastErr"] = String(describing: error).prefix(60).description
+                    self.status["lastErr"] = AIClient.describe(error)
                     self.writeStatus()
                 }
             }

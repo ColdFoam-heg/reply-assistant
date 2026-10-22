@@ -830,7 +830,7 @@ struct DraftView: View {
                     .fill(settings.keyConfigured ? Color.green : Color.orange)
                     .frame(width: 8, height: 8)
                 Text(settings.keyConfigured ? "Key 已配置" : "未配置 Key")
-                    .font(.caption2).fontWeight(.bold).foregroundColor(.white)
+                    .font(.caption2.weight(.bold)).foregroundColor(.white)
             }
             .padding(.horizontal, 9).padding(.vertical, 5)
             .background(Color.white.opacity(0.22))
@@ -852,7 +852,7 @@ struct DraftView: View {
             } else {
                 VStack(alignment: .leading, spacing: 7) {
                     Label("四步搞定", systemImage: "sparkles")
-                        .font(.subheadline).fontWeight(.bold)
+                        .font(.subheadline.weight(.bold))
                     Text("1. 聊天里截个图，回这里选它\n2. 本机 OCR 自动分清「对方 / 我」\n3. 写下想表达的意思，点 AI 起草\n4. 复制粘贴，或开画中画悬浮照着打")
                         .font(.caption).foregroundColor(.secondary)
                 }
@@ -874,7 +874,7 @@ struct DraftView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("对话记录", systemImage: "text.quote")
-                    .font(.subheadline).fontWeight(.bold)
+                    .font(.subheadline.weight(.bold))
                 Spacer()
                 if engine.ocrRunning {
                     HStack(spacing: 5) {
@@ -900,7 +900,7 @@ struct DraftView: View {
     private var intentToneCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label("你想表达", systemImage: "pencil.line")
-                .font(.subheadline).fontWeight(.bold)
+                .font(.subheadline.weight(.bold))
             TextField("可留空，AI 顺着对方最后一句接话", text: $engine.intent)
                 .textFieldStyle(.roundedBorder)
             ScrollView(.horizontal, showsIndicators: false) {
@@ -913,7 +913,7 @@ struct DraftView: View {
                                 Image(systemName: RAConstants.toneIcons[i])
                                 Text(tone)
                             }
-                            .font(.caption).fontWeight(.bold)
+                            .font(.caption.weight(.bold))
                             .padding(.horizontal, 11).padding(.vertical, 7)
                             .background(engine.tone == tone ? settings.themeValue.gradient : LinearGradient(colors: [Color(.secondarySystemBackground), Color(.secondarySystemBackground)], startPoint: .leading, endPoint: .trailing))
                             .foregroundColor(engine.tone == tone ? .white : .primary)
@@ -957,7 +957,7 @@ struct DraftView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("悬浮预览 · 系统画中画", systemImage: "pip.fill")
-                    .font(.subheadline).fontWeight(.bold)
+                    .font(.subheadline.weight(.bold))
                 Spacer()
                 if pip.isPreparing {
                     ProgressView()
@@ -995,7 +995,7 @@ struct DraftView: View {
                     .padding(5)
                     .background(settings.themeValue.gradient)
                     .clipShape(Circle())
-                Text(style.0).font(.caption).fontWeight(.bold)
+                Text(style.0).font(.caption.weight(.bold))
                 Spacer()
                 Text("候选 \(idx + 1)").font(.caption2).foregroundColor(.secondary)
             }
@@ -1106,7 +1106,7 @@ struct ModelPickerView: View {
                         .font(.caption2).foregroundColor(.secondary).lineLimit(1)
                     HStack(spacing: 6) {
                         Text(m.isFree ? "免费" : m.priceText)
-                            .font(.caption2).fontWeight(.bold)
+                            .font(.caption2.weight(.bold))
                             .foregroundColor(m.isFree ? .green : .orange)
                         if m.contextLength > 0 {
                             Text(m.contextText).font(.caption2).foregroundColor(.secondary)
@@ -1257,7 +1257,7 @@ struct RASettingsView: View {
                                             .frame(width: 42, height: 42)
                                         if settings.themeValue == t {
                                             Image(systemName: "checkmark")
-                                                .font(.caption).fontWeight(.bold).foregroundColor(.white)
+                                                .font(.caption.weight(.bold)).foregroundColor(.white)
                                         }
                                     }
                                     Text(t.name).font(.caption2).foregroundColor(.primary)

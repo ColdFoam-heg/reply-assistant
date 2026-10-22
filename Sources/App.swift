@@ -16,6 +16,7 @@ import UserNotifications
 
 @main
 struct ReplyAssistantApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     var body: some Scene {
         WindowGroup {
             RootView()
@@ -441,6 +442,34 @@ struct PlayerStageView: UIViewRepresentable {
     }
 }
 
+// MARK: - 通知动作（复制第一条建议）
+
+final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        let copyAction = UNNotificationAction(identifier: "COPY_FIRST", title: "复制第一条建议", options: [])
+        let category = UNNotificationCategory(identifier: "DRAFT_CAT", actions: [copyAction], intentIdentifiers: [], options: [])
+        center.setNotificationCategories([category])
+        return true
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        if response.actionIdentifier == "COPY_FIRST",
+           let raw = KeychainHelper.get("draft_latest"),
+           let data = raw.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(DraftPayload.self, from: data),
+           let first = payload.candidates.first {
+            UIPasteboard.general.string = first
+        }
+        completionHandler()
+    }
+}
+
 // MARK: - 直播基础设施
 
 final class DarwinWatcher: ObservableObject {
@@ -462,7 +491,7 @@ final class DarwinWatcher: ObservableObject {
 struct BroadcastPickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
         let v = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 52, height: 52))
-        v.preferredExtension = "com.lengmo.ReplyAssistant.ReplyBroadcast"
+        v.preferredExtension = (Bundle.main.bundleIdentifier ?? "com.lengmo.ReplyAssistant") + ".ReplyBroadcast"
         v.showsMicrophoneButton = false
         return v
     }
@@ -493,6 +522,29 @@ final class DraftEngine: ObservableObject {
         transcriptDraft = transcriptText(rebuilt)
         if rebuilt.isEmpty {
             errorText = "这张图没识别出对话，换一张更清晰的聊天截图试试"
+        }
+    }
+
+    @Published var askText: String = ""
+    @Published var askMode: Int = 0
+    @Published var askAnswer: String = ""
+    @Published var askRunning: Bool = false
+
+    func runAsk(settings: RASettingsStore) async {
+        let key = settings.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty { askAnswer = "先去「设置」页填入你的 OpenRouter Key"; return }
+        let raw = askText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty { askAnswer = askMode == 0 ? "先写下你想问 AI 的问题" : "先写下你想润色的那句话"; return }
+        askRunning = true
+        askAnswer = ""
+        defer { askRunning = false }
+        let question = askMode == 1
+            ? "请把我这句话润色得更自然得体，保持原意、语气和大致长度，只输出润色后的句子：\n" + raw
+            : raw
+        do {
+            askAnswer = try await AIClient.ask(apiKey: key, model: settings.model, transcript: transcriptText(lines), question: question)
+        } catch {
+            askAnswer = "出错了：" + String(describing: error)
         }
     }
 
@@ -578,6 +630,8 @@ struct DraftView: View {
     @StateObject private var darwin = DarwinWatcher()
     @State private var inbox: DraftPayload? = nil
     @State private var extAlive = false
+    @State private var diagText: String = ""
+    @State private var notifDenied = false
     @AppStorage("ra_last_draft_id") private var lastDraftID: String = ""
     @AppStorage("pb_last_cc") private var lastPasteboardCC: Int = -1
     @Environment(\.scenePhase) private var scenePhase
@@ -590,6 +644,7 @@ struct DraftView: View {
                     broadcastCard
                     materialCard
                     intentToneCard
+                    askCard
                     draftButton
                     if !engine.errorText.isEmpty {
                         Text(engine.errorText)
@@ -615,7 +670,7 @@ struct DraftView: View {
             }
             .onAppear {
                 if lastPasteboardCC == -1 { lastPasteboardCC = UIPasteboard.general.changeCount }
-                darwin.onSignal = { checkInbox() }
+                darwin.onSignal = { checkInbox(fromSignal: true) }
                 darwin.start()
                 checkInbox()
             }
@@ -627,6 +682,73 @@ struct DraftView: View {
             }
         }
         .navigationViewStyle(.stack)
+    }
+
+    private var askCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "questionmark.bubble")
+                    .foregroundColor(settings.themeValue.accent)
+                Text("问问 AI").font(.subheadline.weight(.bold))
+                Spacer()
+                Picker("", selection: $engine.askMode) {
+                    Text("问问").tag(0)
+                    Text("润色我的话").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 176)
+            }
+            if engine.askMode == 0 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(["她这句什么意思？", "怎么回显得高情商？", "帮我想个俏皮的回法", "这话该怎么接？"], id: \.self) { q in
+                            Button(q) { engine.askText = q }
+                                .font(.caption2)
+                                .buttonStyle(.bordered)
+                                .tint(settings.themeValue.accent)
+                        }
+                    }
+                }
+            }
+            TextField(engine.askMode == 0 ? "想问 AI 什么，写在这里" : "把你想说的话写这里，AI 帮你润色", text: $engine.askText)
+                .textFieldStyle(.roundedBorder)
+            Button {
+                Task { await engine.runAsk(settings: settings) }
+            } label: {
+                HStack {
+                    if engine.askRunning { ProgressView() }
+                    Text(engine.askRunning ? "AI 正在想…" : (engine.askMode == 0 ? "问 AI" : "帮我润色"))
+                        .font(.subheadline.weight(.bold))
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(settings.themeValue.accent)
+            .disabled(engine.askRunning)
+            if !engine.askAnswer.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(engine.askAnswer)
+                        .font(.subheadline)
+                        .textSelection(.enabled)
+                    HStack {
+                        Button {
+                            UIPasteboard.general.string = engine.askAnswer
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        } label: {
+                            Label("复制", systemImage: "doc.on.doc").font(.caption)
+                        }
+                        .buttonStyle(.plain).foregroundColor(.teal)
+                        Spacer()
+                        Button("收起") { engine.askAnswer = "" }
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                .padding(10)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+        }
+        .raCard()
     }
 
     private var broadcastCard: some View {
@@ -644,10 +766,36 @@ struct DraftView: View {
             }
             Text("点右侧按钮选「回话助手」开始直播（或控制中心长按屏幕录制）。直播中对方发来消息，几秒后建议会推送通知，也会出现在这里下方。第一次先授权通知。")
                 .font(.caption2).foregroundColor(.secondary)
-            Button("授权通知（直播建议要用）") {
-                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+            HStack(spacing: 14) {
+                Button("授权通知") {
+                    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in
+                        DispatchQueue.main.async { refreshHeartbeat() }
+                    }
+                }
+                .font(.caption).tint(settings.themeValue.accent)
+                Button("发一条测试通知") {
+                    let content = UNMutableNotificationContent()
+                    content.title = "测试通知"
+                    content.body = "能看到这条，说明通知通道没问题"
+                    content.sound = .default
+                    let req = UNNotificationRequest(identifier: "test-" + UUID().uuidString, content: content,
+                                                    trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false))
+                    UNUserNotificationCenter.current().add(req)
+                }
+                .font(.caption).tint(settings.themeValue.accent)
             }
-            .font(.caption).tint(settings.themeValue.accent)
+            if notifDenied {
+                Text("通知被系统关掉了：去 设置 → 通知 → 回话助手 打开，否则建议只能回 App 里看")
+                    .font(.caption2).foregroundColor(.red)
+            }
+            if !diagText.isEmpty {
+                Text(diagText)
+                    .font(.caption2).foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
         }
         .raCard()
     }
@@ -692,7 +840,7 @@ struct DraftView: View {
         .raCard()
     }
 
-    private func checkInbox() {
+    private func checkInbox(fromSignal: Bool = false) {
         refreshHeartbeat()
         guard let raw = KeychainHelper.get("draft_latest"),
               let data = raw.data(using: .utf8),
@@ -701,6 +849,15 @@ struct DraftView: View {
             inbox = payload
             history.add(intent: "直播 · 对方说：" + String(payload.otherText.prefix(12)), candidates: payload.candidates)
             lastDraftID = payload.id
+            if fromSignal && UIApplication.shared.applicationState != .active {
+                let content = UNMutableNotificationContent()
+                content.title = "AI 回话建议 · 对方说「" + String(payload.otherText.prefix(10)) + "」"
+                content.body = payload.candidates.first ?? ""
+                content.sound = .default
+                content.categoryIdentifier = "DRAFT_CAT"
+                let req = UNNotificationRequest(identifier: payload.id, content: content, trigger: nil)
+                UNUserNotificationCenter.current().add(req)
+            }
         }
     }
 
@@ -710,6 +867,31 @@ struct DraftView: View {
         } else {
             extAlive = false
         }
+        if let raw = KeychainHelper.get("ext_status"),
+           let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            diagText = fmtDiag(obj)
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            DispatchQueue.main.async { notifDenied = (s.authorizationStatus == .denied) }
+        }
+    }
+
+    private func fmtDiag(_ st: [String: Any]) -> String {
+        func t(_ k: String) -> String {
+            guard let v = st[k] as? NSNumber else { return "—" }
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm:ss"
+            return f.string(from: Date(timeIntervalSince1970: v.doubleValue))
+        }
+        let frames = (st["frames"] as? NSNumber)?.intValue ?? 0
+        let ocr = (st["ocrRuns"] as? NSNumber)?.intValue ?? 0
+        let lines = (st["lastLines"] as? NSNumber)?.intValue ?? 0
+        let drafts = (st["drafts"] as? NSNumber)?.intValue ?? 0
+        let err = (st["lastErr"] as? String) ?? ""
+        var s = "诊断：处理帧 \(frames) · 识别 \(ocr) 次（最近 \(t("lastOcrAt"))，读到 \(lines) 行）· 成功起草 \(drafts) 次"
+        if !err.isEmpty { s += "\n最近错误：" + err }
+        return s
     }
 
     private func autoImportIfNeeded() {
@@ -1276,7 +1458,7 @@ struct RASettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Section(header: Text("关于")) {
-                    HStack { Text("版本"); Spacer(); Text("2.0.0").foregroundColor(.secondary) }
+                    HStack { Text("版本"); Spacer(); Text("3.0.0").foregroundColor(.secondary) }
                     HStack { Text("开发者"); Spacer(); Text("LengMo").foregroundColor(.secondary) }
                     Text("© 2026 LengMo").font(.caption).foregroundColor(.secondary)
                 }

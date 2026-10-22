@@ -23,8 +23,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: "回话助手"
-        CFBundleShortVersionString: "3.0.0"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "4.0.0"
+        CFBundleVersion: "6"
         NSHumanReadableCopyright: "© 2026 LengMo"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:

@@ -92,11 +92,15 @@ final class RASettingsStore: ObservableObject {
     @Published var theme: String {
         didSet { UserDefaults.standard.set(theme, forKey: "ra_theme") }
     }
+    @Published var customTone: String {
+        didSet { UserDefaults.standard.set(customTone, forKey: "ra_custom_tone") }
+    }
     init() {
         let d = UserDefaults.standard
         apiKey = d.string(forKey: "or_api_key") ?? ""
         model = d.string(forKey: "or_model") ?? RAConstants.defaultModel
         theme = d.string(forKey: "ra_theme") ?? RATheme.ocean.rawValue
+        customTone = d.string(forKey: "ra_custom_tone") ?? ""
     }
     var themeValue: RATheme { RATheme(rawValue: theme) ?? .ocean }
     var keyConfigured: Bool {
@@ -106,12 +110,16 @@ final class RASettingsStore: ObservableObject {
 
 enum RAConstants {
     static let defaultModel = "minimax/minimax-m3.1-flash:free"
-    static let tones: [String] = ["自然接话", "温柔体贴", "幽默风趣", "直截了当", "正式礼貌"]
-    static let toneIcons: [String] = ["text.bubble", "heart.fill", "face.smiling", "bolt.fill", "briefcase.fill"]
+    static let tones: [String] = ["自然接话", "温柔体贴", "幽默风趣", "直截了当", "正式礼貌", "自定义"]
+    static let toneIcons: [String] = ["text.bubble", "heart.fill", "face.smiling", "bolt.fill", "briefcase.fill", "slider.horizontal.3"]
+    static let partners: [String] = ["不指定", "女朋友", "朋友", "家人", "领导", "客户"]
+    static let lengths: [String] = ["短句", "适中", "详细"]
     static let candidateStyles: [(String, String)] = [
         ("暖心版", "heart.fill"),
         ("俏皮版", "face.smiling.inverse"),
         ("稳重版", "checkmark.shield.fill"),
+        ("走心版", "sparkles"),
+        ("精简版", "scissors"),
     ]
     /// 精选免费模型（来自 2026-10-22 免费模型扫描，聊天向）
     static let curatedFree: [String] = [
@@ -293,20 +301,31 @@ case.empty: return "模型没有返回内容，换个模型或稍后再试"
 }
 
 enum AIClient {
-static func draft(apiKey: String, model: String, transcript: String, intent: String, tone: String) async throws -> [String] {
+static func draft(apiKey: String, model: String, transcript: String, intent: String, tone: String, partner: String, length: String, count: Int) async throws -> [String] {
 let url = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 var req = URLRequest(url: url, timeoutInterval: 60)
 req.httpMethod = "POST"
 req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-let system = "你是一个高情商的回话参谋，帮用户回复聊天消息。根据对话记录和用户想表达的意思，起草 3 条可以直接发送的回复候选。要求：三条风格有明显区别（依次偏暖心、偏俏皮、偏稳重）；自然口语，像真人打字聊天；长度贴合聊天场景；不要解释、不要加前后缀，只输出 3 行，每行一条，格式为「1. 内容」「2. 内容」「3. 内容」。"
+var system = "你是一个高情商的回话参谋，帮用户回复聊天消息。根据对话记录和用户想表达的意思，起草 "
+        system += String(count)
+        system += " 条可以直接发送的回复候选。要求：每条风格有明显区别（依次偏暖心、俏皮、稳重、走心、精简）；自然口语，像真人打字聊天；不要解释、不要加前后缀，只输出 "
+        system += String(count)
+        system += " 行，每行一条，格式为「1. 内容」「2. 内容」以此类推。"
 let intentText = intent.isEmpty ? "顺着对方最后一句自然接话" : intent
-var user = "\n"
-user += transcript
-user += "\n\n"
-user += intentText
-user += "\n"
-user += tone
+var user = "【对话记录】\n"
+        user += transcript
+        if partner != "不指定" {
+            user += "\n\n【聊天对象】"
+            user += partner
+            user += "（注意分寸与亲疏）"
+        }
+        user += "\n\n【我想表达】"
+        user += intentText
+        user += "\n【语气基调】"
+        user += tone
+        user += "\n【回复长度】"
+        user += lengthHint(length)
 let body: [String: Any] = [
 "model": model,
 "messages": [
@@ -328,12 +347,20 @@ let message = choices.first?["message"] as? [String: Any],
 let content = message["content"] as? String else {
 throw AIError.empty
 }
-let cands = parseCandidates(content)
+let cands = parseCandidates(content, count: count)
 if cands.isEmpty { throw AIError.empty}
 return cands
 }
 
-static func parseCandidates(_ content: String) -> [String] {
+static func lengthHint(_ length: String) -> String {
+        switch length {
+        case "短句": return "短句，每条尽量 15 字以内"
+        case "详细": return "可以稍长，把话说完整、说贴心"
+        default: return "适中，像日常聊天那样"
+        }
+    }
+
+    static func parseCandidates(_ content: String, count: Int) -> [String] {
 var out: [String] = []
 for raw in content.split(separator: "\n") {
 var s = raw.trimmingCharacters(in:.whitespaces)
@@ -345,7 +372,7 @@ if s.hasPrefix("- ") { s = String(s.dropFirst(2))}
 s = s.trimmingCharacters(in:.whitespaces)
 if !s.isEmpty { out.append(s)}
 }
-return Array(out.prefix(3))
+return Array(out.prefix(count))
 }
 
 /// 测试 Key 是否可用，返回人类可读的账户摘要
@@ -443,7 +470,9 @@ return out
 enum TextVideoFactory {
     static func makeVideo(text: String, theme: RATheme) async throws -> URL {
         let size = CGSize(width: 880, height: 400)
-        let image = renderImage(text: text, theme: theme, size: size)
+        let uiImage = renderImage(text: text, theme: theme, size: size)
+        guard let ciImage = CIImage(image: uiImage) else { throw AIError.empty }
+        let ciContext = CIContext(options: [.cacheIntermediates: false])
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("pip_reply.mp4")
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
@@ -473,9 +502,12 @@ enum TextVideoFactory {
             input.requestMediaDataWhenReady(on: queue) {
                 if finished { return }
                 while input.isReadyForMoreMediaData && frame < totalFrames {
-                    if let pool = adaptor.pixelBufferPool,
-                       let pb = makePixelBuffer(pool: pool, image: image) {
-                        adaptor.append(pb, withPresentationTime: CMTime(value: frame, timescale: 1))
+                    if let pool = adaptor.pixelBufferPool {
+                        var pbOpt: CVPixelBuffer?
+                        if CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbOpt) == kCVReturnSuccess, let pb = pbOpt {
+                            ciContext.render(ciImage, to: pb)
+                            adaptor.append(pb, withPresentationTime: CMTime(value: frame, timescale: 1))
+                        }
                     }
                     frame += 1
                 }
@@ -495,49 +527,31 @@ enum TextVideoFactory {
         return url
     }
 
-    private static func renderImage(text: String, theme: RATheme, size: CGSize) -> CGImage {
+    /// 浅色简约帧：暖白底、炭灰字、一条主题色细线，留白多
+    private static func renderImage(text: String, theme: RATheme, size: CGSize) -> UIImage {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
-        let uiImage = renderer.image { _ in
-            theme.darkUIColor.setFill()
+        return renderer.image { _ in
+            UIColor(red: 0.975, green: 0.972, blue: 0.960, alpha: 1).setFill()
             UIRectFill(CGRect(origin: .zero, size: size))
             theme.accentUIColor.setFill()
-            UIRectFill(CGRect(x: 0, y: 0, width: size.width, height: 10))
+            UIRectFill(CGRect(x: 36, y: 42, width: 54, height: 6))
             let titleAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.boldSystemFont(ofSize: 30),
-                .foregroundColor: theme.accentUIColor,
+                .font: UIFont.systemFont(ofSize: 25, weight: .medium),
+                .foregroundColor: UIColor(red: 0.45, green: 0.45, blue: 0.48, alpha: 1),
             ]
-            ("AI 起草 · 回话助手" as NSString).draw(at: CGPoint(x: 36, y: 26), withAttributes: titleAttrs)
+            ("AI 起草 · 回话助手" as NSString).draw(at: CGPoint(x: 36, y: 62), withAttributes: titleAttrs)
             let para = NSMutableParagraphStyle()
             para.lineSpacing = 10
             let bodyAttrs: [NSAttributedString.Key: Any] = [
                 .font: UIFont.systemFont(ofSize: 46, weight: .semibold),
-                .foregroundColor: UIColor.white,
+                .foregroundColor: UIColor(red: 0.11, green: 0.11, blue: 0.13, alpha: 1),
                 .paragraphStyle: para,
             ]
-            let rect = CGRect(x: 36, y: 88, width: size.width - 72, height: size.height - 112)
+            let rect = CGRect(x: 36, y: 112, width: size.width - 72, height: size.height - 136)
             (text as NSString).draw(in: rect, withAttributes: bodyAttrs)
         }
-        return uiImage.cgImage ?? UIImage().cgImage!
-    }
-
-    private static func makePixelBuffer(pool: CVPixelBufferPool, image: CGImage) -> CVPixelBuffer? {
-        var pb: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess,
-              let pixelBuffer = pb else { return nil }
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
-        let w = CVPixelBufferGetWidth(pixelBuffer)
-        let h = CVPixelBufferGetHeight(pixelBuffer)
-        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let info = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        guard let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8, bytesPerRow: bpr, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info) else { return nil }
-        ctx.translateBy(x: 0, y: CGFloat(h))
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return pixelBuffer
     }
 }
 
@@ -681,6 +695,9 @@ final class DraftEngine: ObservableObject {
     @Published var transcriptDraft: String = ""
     @Published var intent: String = ""
     @Published var tone: String = RAConstants.tones[0]
+    @Published var partner: String = RAConstants.partners[0]
+    @Published var length: String = RAConstants.lengths[1]
+    @Published var draftCount: Int = 3
     @Published var ocrRunning = false
     @Published var aiRunning = false
     @Published var candidates: [String] = []
@@ -716,7 +733,8 @@ final class DraftEngine: ObservableObject {
         errorText = ""
         defer { aiRunning = false }
         do {
-            candidates = try await AIClient.draft(apiKey: key, model: settings.model, transcript: convo, intent: intent, tone: tone)
+            let effTone = tone == "自定义" ? (settings.customTone.isEmpty ? "自然接话" : settings.customTone) : tone
+            candidates = try await AIClient.draft(apiKey: key, model: settings.model, transcript: convo, intent: intent, tone: effTone, partner: partner, length: length, count: draftCount)
         } catch {
             errorText = error.localizedDescription
         }
@@ -785,8 +803,7 @@ struct DraftView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     headerCard
-                    screenshotCard
-                    transcriptCard
+                    materialCard
                     intentToneCard
                     draftButton
                     if !engine.errorText.isEmpty {
@@ -801,7 +818,7 @@ struct DraftView: View {
                 }
                 .padding(16)
             }
-            .background(Color(.systemGroupedBackground))
+            .background(LinearGradient(colors: [settings.themeValue.accent.opacity(0.13), Color(.systemGroupedBackground)], startPoint: .top, endPoint: .center).ignoresSafeArea())
             .navigationTitle("回话助手")
             .sheet(isPresented: $showPicker) {
                 PhotoPicker { img in
@@ -842,46 +859,58 @@ struct DraftView: View {
         .shadow(color: .black.opacity(0.12), radius: 10, x: 0, y: 4)
     }
 
-    private var screenshotCard: some View {
-        VStack(spacing: 10) {
-            if let img = engine.image {
-                Image(uiImage: img)
-                    .resizable().scaledToFit()
-                    .frame(maxHeight: 200)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-            } else {
-                VStack(alignment: .leading, spacing: 7) {
-                    Label("四步搞定", systemImage: "sparkles")
-                        .font(.subheadline.weight(.bold))
-                    Text("1. 聊天里截个图，回这里选它\n2. 本机 OCR 自动分清「对方 / 我」\n3. 写下想表达的意思，点 AI 起草\n4. 复制粘贴，或开画中画悬浮照着打")
-                        .font(.caption).foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            Button {
-                showPicker = true
-            } label: {
-                Label(engine.image == nil ? "选一张聊天截图" : "换一张截图", systemImage: "photo.on.rectangle.angled")
-                    .frame(maxWidth: .infinity).padding(.vertical, 4)
-            }
-            .buttonStyle(.bordered)
-            .tint(settings.themeValue.accent)
-        }
-        .raCard()
-    }
-
-    private var transcriptCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("对话记录", systemImage: "text.quote")
-                    .font(.subheadline.weight(.bold))
+    private var materialCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "photo.on.rectangle.angled")
+                    .foregroundColor(settings.themeValue.accent)
+                Text("聊天截图").font(.subheadline.weight(.bold))
                 Spacer()
                 if engine.ocrRunning {
                     HStack(spacing: 5) {
                         ProgressView()
                         Text("本机识别中…").font(.caption).foregroundColor(.secondary)
                     }
-                } else if !engine.lines.isEmpty {
+                }
+            }
+            if let img = engine.image {
+                Image(uiImage: img)
+                    .resizable().scaledToFit()
+                    .frame(maxHeight: 190)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            } else {
+                Text("在聊天里截个图，选进来或从剪贴板粘贴。本机 OCR 会自动分清「对方 / 我」，截图不上传。")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack(spacing: 10) {
+                Button {
+                    showPicker = true
+                } label: {
+                    Label(engine.image == nil ? "选截图" : "换一张", systemImage: "photo")
+                        .frame(maxWidth: .infinity).padding(.vertical, 3)
+                }
+                .buttonStyle(.bordered)
+                .tint(settings.themeValue.accent)
+                Button {
+                    if let img = UIPasteboard.general.image {
+                        Task { await engine.processImage(img) }
+                    } else {
+                        engine.errorText = "剪贴板里没有图片，先在聊天里截图并复制"
+                    }
+                } label: {
+                    Label("粘贴截图", systemImage: "doc.on.clipboard")
+                        .frame(maxWidth: .infinity).padding(.vertical, 3)
+                }
+                .buttonStyle(.bordered)
+            }
+            Divider()
+            HStack(spacing: 6) {
+                Image(systemName: "text.quote")
+                    .foregroundColor(settings.themeValue.accent)
+                Text("对话记录").font(.subheadline.weight(.bold))
+                Spacer()
+                if !engine.lines.isEmpty {
                     Text("\(engine.lines.filter { $0.speaker != .system }.count) 条消息")
                         .font(.caption).foregroundColor(.secondary)
                 }
@@ -891,14 +920,14 @@ struct DraftView: View {
                 .padding(4)
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 10))
-            Text("识别结果有错字可以直接改；介意的内容删掉再起草。")
+            Text("识别有错字可以直接改；介意的内容删掉再起草。")
                 .font(.caption2).foregroundColor(.secondary)
         }
         .raCard()
     }
 
     private var intentToneCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 11) {
             Label("你想表达", systemImage: "pencil.line")
                 .font(.subheadline.weight(.bold))
             TextField("可留空，AI 顺着对方最后一句接话", text: $engine.intent)
@@ -923,25 +952,66 @@ struct DraftView: View {
                     }
                 }
             }
+            if engine.tone == "自定义" {
+                TextField("自定义语气，如：撒娇一点 / 官方一点", text: $settings.customTone)
+                    .textFieldStyle(.roundedBorder)
+            }
+            HStack(spacing: 6) {
+                Text("对象").font(.caption).foregroundColor(.secondary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(RAConstants.partners, id: \.self) { p in
+                            miniChip(p, selected: engine.partner == p) { engine.partner = p }
+                        }
+                    }
+                }
+            }
+            HStack(spacing: 6) {
+                Text("长度").font(.caption).foregroundColor(.secondary)
+                ForEach(RAConstants.lengths, id: \.self) { l in
+                    miniChip(l, selected: engine.length == l) { engine.length = l }
+                }
+                Spacer()
+                Text("条数").font(.caption).foregroundColor(.secondary)
+                ForEach([3, 5], id: \.self) { n in
+                    miniChip("\(n) 条", selected: engine.draftCount == n) { engine.draftCount = n }
+                }
+            }
         }
         .raCard()
     }
 
+    private func miniChip(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.caption.weight(.bold))
+                .padding(.horizontal, 11).padding(.vertical, 7)
+                .background(selected ? settings.themeValue.gradient : LinearGradient(colors: [Color(.secondarySystemBackground), Color(.secondarySystemBackground)], startPoint: .leading, endPoint: .trailing))
+                .foregroundColor(selected ? .white : .primary)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func draftAndSave() {
+        Task {
+            await engine.runDraft(settings: settings)
+            if !engine.candidates.isEmpty && engine.candidates != lastSaved {
+                history.add(intent: engine.intent, candidates: engine.candidates)
+                lastSaved = engine.candidates
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            }
+        }
+    }
+
     private var draftButton: some View {
         Button {
-            Task {
-                await engine.runDraft(settings: settings)
-                if !engine.candidates.isEmpty && engine.candidates != lastSaved {
-                    history.add(intent: engine.intent, candidates: engine.candidates)
-                    lastSaved = engine.candidates
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                }
-            }
+            draftAndSave()
         } label: {
             HStack {
                 if engine.aiRunning { ProgressView().tint(.white) }
                 Image(systemName: "sparkles")
-                Text(engine.aiRunning ? "AI 正在起草…" : "AI 起草 3 条候选")
+                Text(engine.aiRunning ? "AI 正在起草…" : "AI 起草候选")
                     .font(.headline)
             }
             .foregroundColor(.white)
@@ -978,7 +1048,18 @@ struct DraftView: View {
 
     private var candidatesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("候选回复").font(.headline)
+            HStack {
+                Text("候选回复").font(.headline)
+                Spacer()
+                Button {
+                    draftAndSave()
+                } label: {
+                    Label("换一批", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption.weight(.bold))
+                }
+                .tint(settings.themeValue.accent)
+                .disabled(engine.aiRunning)
+            }
             ForEach(Array(engine.candidates.enumerated()), id: \.offset) { idx, cand in
                 candidateCard(idx: idx, text: cand)
             }
@@ -1020,7 +1101,21 @@ struct DraftView: View {
             }
             .font(.subheadline)
         }
-        .raCard()
+        .padding(14)
+        .background(cardTint(idx))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 2)
+    }
+
+    private func cardTint(_ idx: Int) -> Color {
+        let tints: [Color] = [
+            Color(red: 0.925, green: 0.970, blue: 0.955),
+            Color(red: 0.960, green: 0.940, blue: 0.990),
+            Color(red: 0.990, green: 0.960, blue: 0.920),
+            Color(red: 0.930, green: 0.950, blue: 0.990),
+            Color(red: 0.990, green: 0.935, blue: 0.950),
+        ]
+        return tints[idx % tints.count]
     }
 }
 
@@ -1136,6 +1231,8 @@ struct ModelPickerView: View {
 
 struct HistoryView: View {
     @EnvironmentObject var history: HistoryStore
+    @EnvironmentObject var pip: PiPPlayerManager
+    @EnvironmentObject var settings: RASettingsStore
     @State private var copiedKey: String = ""
     var body: some View {
         NavigationView {
@@ -1165,6 +1262,13 @@ struct HistoryView: View {
                                         } label: {
                                             Image(systemName: copiedKey == item.id.uuidString + cand ? "checkmark" : "doc.on.doc")
                                                 .foregroundColor(.teal)
+                                        }
+                                        .buttonStyle(.plain)
+                                        Button {
+                                            pip.prepareAndFloat(text: cand, theme: settings.themeValue)
+                                        } label: {
+                                            Image(systemName: "pip.enter")
+                                                .foregroundColor(.purple)
                                         }
                                         .buttonStyle(.plain)
                                     }
@@ -1269,12 +1373,15 @@ struct RASettingsView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 4)
                 }
+                Section(header: Text("起草偏好"), footer: Text("在起草页把语气选成「自定义」时，AI 就按这里写的来。")) {
+                    TextField("自定义语气，如：撒娇一点", text: $settings.customTone)
+                }
                 Section(header: Text("隐私")) {
                     Text("截图识别（OCR）在本机离线完成，截图本身不会上传。只有你点「AI 起草」时，对话文字才会发给 OpenRouter。历史记录只存在本机。")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Section(header: Text("关于")) {
-                    HStack { Text("版本"); Spacer(); Text("1.1.0").foregroundColor(.secondary) }
+                    HStack { Text("版本"); Spacer(); Text("1.2.0").foregroundColor(.secondary) }
                     HStack { Text("开发者"); Spacer(); Text("LengMo").foregroundColor(.secondary) }
                     Text("© 2026 LengMo").font(.caption).foregroundColor(.secondary)
                 }

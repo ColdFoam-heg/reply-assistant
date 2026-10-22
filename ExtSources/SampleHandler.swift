@@ -148,7 +148,7 @@ class SampleHandler: RPBroadcastSampleHandler {
                     KeychainHelper.set(str, account: "draft_latest")
                 }
                 CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                                     "com.lengmo.replyassistant.newdraft" as CFString,
+                                                     CFNotificationName("com.lengmo.replyassistant.newdraft" as CFString),
                                                      nil, nil, true)
                 notify(title: "AI 回话建议 · 对方说「" + String(otherText.prefix(10)) + "」",
                        body: cands.first ?? "")
